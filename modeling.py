@@ -1,52 +1,58 @@
+import os
 import torch
 import torch.nn as nn
-import os
 from rwkv.model import RWKV
+from rwkv.utils import PIPELINE
+from deep_rwkv.config import ProjectConfig
 
 class ValueHead(nn.Module):
-    def __init__(self, input_dim, hidden_dim=1024):
+    def __init__(self, config):
         super().__init__()
+        self.config = config
         self.net = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, hidden_dim, bias=False),
+            nn.LayerNorm(config.input_dim),
+            nn.Linear(config.input_dim, config.hidden_dim, bias=False),
             nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Tanh() # Output range [-1, 1]
+            nn.Linear(config.hidden_dim, 1, bias=False),
+            nn.Tanh()
         )
 
     def forward(self, x):
         return self.net(x)
 
-class DeepRWKVWrapper:
-    def __init__(self, config):
-        print(f"[DeepRWKV] Initializing v7 Kernel on A100...")
+class DeepRWKV(nn.Module):
+    def __init__(self, config: ProjectConfig):
+        super().__init__()
+        self.config = config
+        
+        self._setup_environment()
+        
+        self.backbone = RWKV(model=config.model.model_path, strategy=config.model.strategy)
+        self.pipeline = PIPELINE(self.backbone, config.model.vocab_path)
+        self.args = self.backbone.args
+        self.config.value_head.input_dim = self.args.n_embd
+        
+        self.value_head = ValueHead(config.value_head)
+        
+        if config.mcts.use_learned_value:
+            self._load_value_head()
+
+    def _setup_environment(self):
         os.environ["RWKV_V7_ON"] = "1"
         os.environ["RWKV_JIT_ON"] = "1"
         os.environ["RWKV_CUDA_ON"] = "1"
-        
-        self.model = RWKV(model=config.model_path, strategy=config.strategy)
-        self.config = config
-        self.args = self.model.args
-        
-        self.value_head = None
-        if config.use_learned_value and os.path.exists(config.value_head_path):
-            print(f"[DeepRWKV] Loading Value Head from {config.value_head_path}")
-            self.value_head = ValueHead(self.args.n_embd).to("cuda").to(dtype=torch.float16)
-            self.value_head.load_state_dict(torch.load(config.value_head_path))
-            self.value_head.eval()
+    
+    def _load_value_head(self):
+        path = self.config.value_head.checkpoint_path
+        if path and os.path.exists(path):
+            print(f"[DeepRWKV] Loading Value Head from: {path}")
+            self.value_head.load_state_dict(torch.load(path, map_location=self.backbone.device))
         else:
-            print("[DeepRWKV] No Value Head found/enabled. Using Heuristic Engine.")
+            print(f"[DeepRWKV] Warning: Value Head checkpoint not found at {path}. Using random initialization.")
 
-    def forward_with_hidden(self, tokens, state=None):
-        with torch.no_grad():
-            logits, new_state = self.model.forward(tokens, state)
-            hidden_proxy = logits
-        return logits, new_state, hidden_proxy
+    def forward_policy(self, tokens, states):
+        return self.backbone.forward(tokens, states)
 
-    def estimate_value(self, hidden_proxy):
-        if self.value_head is None:
-            return None
-        if hidden_proxy.shape[-1] != self.args.n_embd:
-            return 0.0 
-             
-        return self.value_head(hidden_proxy).item()
+    def forward_value(self, states):
+        last_ffn_state = states[-1]  # This is a strong assumption and may need tuning.
+        return self.value_head(last_ffn_state)
