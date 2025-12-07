@@ -1,6 +1,6 @@
 # DeepRWKV-Reasoning
 
-**DeepRWKV-Reasoning is a framework designed to enhance the reasoning capabilities of Large Language Models through sophisticated test-time search algorithms.This project leverages the unique architectural advantages of the RWKV model, combining it with a high-performance, asynchronous Monte Carlo Tree Search engine to create a powerful System 2 thinking machine.
+DeepRWKV-Reasoning is a framework designed to enhance the reasoning capabilities of Large Language Models through sophisticated test-time search algorithms.This project leverages the unique architectural advantages of the RWKV model, combining it with a high-performance, asynchronous Monte Carlo Tree Search engine to create a powerful System 2 thinking machine.
 
 The core of this project is the **Parallel Universe Search** mechanism, an advanced MCTS implementation where multiple search strategies explore the problem space concurrently, converging on a robust solution through a consensus mechanism.
 
