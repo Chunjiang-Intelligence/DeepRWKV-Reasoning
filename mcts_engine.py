@@ -1,125 +1,149 @@
 import torch
 import torch.nn.functional as F
-import math
 import numpy as np
-from copy import deepcopy
+import asyncio
+from typing import List, Dict, Optional, Tuple
+from deep_rwkv.config import ProjectConfig
+from deep_rwkv.modeling import DeepRWKV
+from deep_kv.utils import clone_state, get_special_tokens, calculate_entropy, add_dirichlet_noise
 
-class FluxNode:
-    def __init__(self, token_id, state, parent=None, prior=0.0):
-        self.token_id = token_id
-        self.state = state
+class MCTSNode:
+    def __init__(self, parent: Optional['MCTSNode'], prior: float):
         self.parent = parent
-        self.children = {}
-        self.visits = 0
+        self.children: Dict[int, 'MCTSNode'] = {}
+        self.visit_count = 0
         self.value_sum = 0.0
         self.prior = prior
-        self.is_terminal = False
-        self.policy_entropy = 0.0 
+        self.state = None
 
-    def value(self):
-        return self.value_sum / (self.visits + 1e-6)
+    @property
+    def value(self) -> float:
+        if self.visit_count == 0:
+            return 0.0
+        return self.value_sum / self.visit_count
 
-    def uct(self, c_puct=1.2, lambda_ues=0.5):
-        # Uncertainty-Entropy Scaling
-        # 如果该节点产生时的策略熵很高，说明模型很困惑，我们降低其 UCT 分数
-        q_score = self.value()
-        
-        # Standard PUCT
-        u_score = c_puct * self.prior * math.sqrt(self.parent.visits) / (1 + self.visits)
-        
-        # Entropy Penalty
-        penalty = lambda_ues * self.policy_entropy
-        
-        return q_score + u_score - penalty
+    def select_child(self, puct_c: float) -> Tuple[int, 'MCTSNode']:
+        best_score = -float('inf')
+        best_action = -1
+        best_child = None
+        for action, child in self.children.items():
+            score = child.value + puct_c * child.prior * (np.sqrt(self.visit_count) / (1 + child.visit_count))
+            if score > best_score:
+                best_score = score
+                best_action = action
+                best_child = child
+        return best_action, best_child
 
-class FluxMCTS:
-    def __init__(self, wrapper, pipeline, config):
-        self.wrapper = wrapper
-        self.pipeline = pipeline
-        self.cfg = config
+class MCTSEngine:
+    def __init__(self, model: DeepRWKV, config: ProjectConfig):
+        self.model = model
+        self.config = config
+        self.special_tokens = get_special_tokens(model.pipeline)
 
-    def batch_search(self, root_node):
-        for _ in range(self.cfg.mcts_simulations // self.cfg.batch_size):
-            leaves = []
-            
-            # 由于 Python GIL，我们顺序选取 B 个叶子，但这依然比顺序推理快
-            for _ in range(self.cfg.batch_size):
-                node = root_node
-                depth = 0
-                while node.children and depth < self.cfg.depth_limit:
-                    node = max(node.children.values(), key=lambda n: n.uct(
-                        lambda_ues=self.cfg.uncertainty_lambda if self.cfg.use_uncertainty_penalty else 0
-                    ))
-                    depth += 1
-                leaves.append(node)
+    async def run(self, prompt: str, max_new_tokens: int = 256):
+        root_tokens = self.model.pipeline.encode(prompt)
+        _, root_state = self.model.forward_policy(root_tokens, None)
+        
+        root_node = MCTSNode(parent=None, prior=1.0)
+        root_node.state = root_state
 
-            for leaf in leaves:
-                if leaf.visits > 0 and not leaf.is_terminal:
-                    self._expand_and_evaluate(leaf)
-                else:
-                    self._expand_and_evaluate(leaf)
+        await self._expand(root_node, add_noise=True)
 
-    def _expand_and_evaluate(self, node):
-        # Forward Pass
-        # 注意：这里需要深拷贝 state，因为我们要基于它生成
-        # RWKV forward
-        logits, new_state, hidden = self.wrapper.forward_with_hidden([node.token_id], deepcopy(node.state))
-        
-        probs = F.softmax(logits, dim=-1)
-        entropy = -torch.sum(probs * torch.log(probs + 1e-8)).item()
-        
-        v = self.wrapper.estimate_value(hidden)
-        
-        if v is None:
-            # 使用置信度作为 Value
-            max_prob = torch.max(probs).item()
-            v = max_prob * 2 - 1 # Map [0,1] -> [-1, 1]
-        
-        # Backprop
-        curr = node
-        while curr:
-            curr.visits += 1
-            curr.value_sum += v
-            curr = curr.parent
-            
-        # Expansion (Only expand if visits > threshold to save memory, dynamic pruning)
-        if node.visits >= 1:
-            topk = torch.topk(probs, k=3)
-            for val, idx in zip(topk.values, topk.indices):
-                tid = idx.item()
-                if tid not in node.children:
-                    _, child_state, _ = self.wrapper.forward_with_hidden([tid], deepcopy(new_state))
-                    child = FluxNode(tid, child_state, parent=node, prior=val.item())
-                    child.policy_entropy = entropy
-                    node.children[tid] = child
+        generated_tokens = []
+        for _ in range(max_new_tokens):
+            for _ in range(self.config.mcts.simulations_per_step // self.config.mcts.parallel_leaves):
+                await self._run_batch_simulations(root_node)
 
-    def run(self, prompt):
-        input_ids = self.pipeline.encode(prompt)
-        # Prefill
-        _, state, _ = self.wrapper.forward_with_hidden(input_ids, None)
-        root = FluxNode(input_ids[-1], state)
+            action = self._select_action(root_node)
+            if action == self.special_tokens["newline"]:
+                break
+            
+            generated_tokens.append(action)
+            print(self.model.pipeline.decode([action]), end="", flush=True)
+
+            root_node = root_node.children[action]
+            root_node.parent = None
+            if not root_node.children:
+                await self._expand(root_node, add_noise=False)
+
+        return self.model.pipeline.decode(generated_tokens)
+
+    async def _run_batch_simulations(self, root: MCTSNode):
+        paths, leaves = [], []
+        for _ in range(self.config.mcts.parallel_leaves):
+            path, leaf = self._select_leaf(root)
+            paths.append(path)
+            leaves.append(leaf)
+
+        values = await self._evaluate_leaves(leaves)
+
+        for path, value in zip(paths, values):
+            self._backpropagate(path, value)
+
+    def _select_leaf(self, root: MCTSNode) -> Tuple[List[MCTSNode], MCTSNode]:
+        path = [root]
+        node = root
+        while node.children:
+            if not node.state: # This indicates a pruned or abstract node
+                break
+            _, node = node.select_child(self.config.mcts.puct_c)
+            path.append(node)
+        return path, node
+
+    async def _evaluate_leaves(self, leaves: List[MCTSNode]) -> List[float]:
+        tasks = [self._expand_and_get_value(leaf) for leaf in leaves]
+        values = await asyncio.gather(*tasks)
+        return values
+
+    async def _expand_and_get_value(self, node: MCTSNode) -> float:
+        if not node.children:
+            await self._expand(node, add_noise=False)
         
-        print(f"Flux-MCTS: Thinking with {self.cfg.mcts_simulations} sims/token...")
+        value = 0.0
+        if self.config.mcts.use_learned_value:
+            learned_value = self.model.forward_value(node.state).item()
+            value += self.config.mcts.learned_value_weight * learned_value
+
+        if self.config.mcts.learned_value_weight < 1.0:
+            heuristic_value = await self._heuristic_rollout(node)
+            value += (1.0 - self.config.mcts.learned_value_weight) * heuristic_value
         
-        generated = []
-        for _ in range(200): # Max tokens
-            self.batch_search(root)
+        return value
+
+    async def _expand(self, node: MCTSNode, add_noise: bool):
+        logits, _ = self.model.forward_policy([0], clone_state(node.state))
+        probs = F.softmax(logits, dim=-1).squeeze().cpu().numpy()
+        
+        if add_noise:
+            probs = add_dirichlet_noise(probs, self.config.mcts.dirichlet_alpha, self.config.mcts.dirichlet_epsilon)
+
+        for token_id, prob in enumerate(probs):
+            if prob > 1e-5:
+                node.children[token_id] = MCTSNode(parent=node, prior=prob)
+
+    async def _heuristic_rollout(self, node: MCTSNode) -> float:
+        current_state = clone_state(node.state)
+        last_token = 0
+        total_confidence = 0
+        
+        for _ in range(self.config.heuristic.rollout_depth):
+            logits, current_state = self.model.forward_policy([last_token], current_state)
+            probs = F.softmax(logits, dim=-1)
+            confidence, next_token = torch.max(probs, dim=-1)
             
-            if not root.children: break
-            
-            # Select best action
-            best_child = max(root.children.values(), key=lambda n: n.visits)
-            token = best_child.token_id
-            
-            # Output
-            word = self.pipeline.decode([token])
-            print(word, end="", flush=True)
-            generated.append(token)
-            
-            # Prune and Move
-            root = best_child
-            root.parent = None # Detach to free memory
-            
-            if "\n\n" in word: break
-            
-        return self.pipeline.decode(generated)
+            total_confidence += confidence.item()
+            last_token = next_token.item()
+            if last_token == self.special_tokens["newline"]:
+                break
+        
+        avg_confidence = total_confidence / self.config.heuristic.rollout_depth
+        return avg_confidence * 2 - 1
+
+    def _backpropagate(self, path: List[MCTSNode], value: float):
+        for node in reversed(path):
+            node.value_sum += value
+            node.visit_count += 1
+
+    def _select_action(self, root: MCTSNode) -> int:
+        visit_counts = {action: child.visit_count for action, child in root.children.items()}
+        return max(visit_counts, key=visit_counts.get)
