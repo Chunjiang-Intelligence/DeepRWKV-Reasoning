@@ -1,22 +1,22 @@
-from deep_rwkv.config import DeepConfig
-from deep_rwkv.modeling import DeepRWKVWrapper
-from deep_rwkv.mcts_engine import FluxMCTS
-from rwkv.utils import PIPELINE
+import asyncio
+from deep_rwkv.config import ProjectConfig
+from deep_rwkv.modeling import DeepRWKV
+from deep_kv.mcts_engine import MCTSEngine
 
-def main():
-    cfg = DeepConfig()
-    cfg.use_learned_value = False
-    
-    wrapper = DeepRWKVWrapper(cfg)
-    pipeline = PIPELINE(wrapper.model, "rwkv_vocab_v20230424")
-    
-    engine = FluxMCTS(wrapper, pipeline, cfg)
-    
-    problem = "Let S be the set of integers n such that n^2 is a multiple of n+15. Max(S)?"
+async def main():
+    config = ProjectConfig()
+    model = DeepRWKV(config)
+    engine = MCTSEngine(model, config)
+
+    problem = "Let S be the set of all positive integers n such that n^2 is a multiple of n + 15. Find the largest integer in S."
     prompt = f"User: {problem}\n\nAssistant: Let's think step by step."
+
+    print(f"--- Prompt ---\n{prompt}")
+    print("\n--- DeepRWKV Response ---")
     
-    print(f"\n[DeepRWKV] Problem: {problem}")
-    engine.run(prompt)
+    response = await engine.run(prompt, max_new_tokens=300)
+    
+    print(f"\n\n--- Final Answer ---\n{response}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
