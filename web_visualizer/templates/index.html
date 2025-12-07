@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MCTS Visualization</title>
+    <style>
+        .node circle { stroke: steelblue; stroke-width: 3px; }
+        .node text { font: 12px sans-serif; }
+        .link { fill: none; stroke: #ccc; stroke-width: 2px; }
+    </style>
+    <script src="https://d3js.org/d3.v5.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+</head>
+<body>
+    <h1>RWKV Deep Think</h1>
+    <div id="universes"></div>
+    <script>
+        const socket = io.connect('http://' + document.domain + ':' + location.port);
+
+        socket.on('update_tree', function(data) {
+            let universeDiv = document.getElementById('universe-' + data.universe_id);
+            if (!universeDiv) {
+                universeDiv = document.createElement('div');
+                universeDiv.id = 'universe-' + data.universe_id;
+                universeDiv.innerHTML = `<h2>Universe ${data.universe_id} (Strategy: ${data.strategy})</h2><svg width="960" height="600}"></svg>`;
+                document.getElementById('universes').appendChild(universeDiv);
+            }
+            
+            const svg = d3.select(universeDiv).select("svg");
+            svg.selectAll("*").remove();
+            
+            const width = +svg.attr("width");
+            const height = +svg.attr("height");
+            const g = svg.append("g").attr("transform", "translate(40,0)");
+
+            const treeLayout = d3.tree().size([height, width - 160]);
+            const root = d3.hierarchy(data.tree);
+            treeLayout(root);
+
+            const nodes = root.descendants();
+            const links = root.links();
+
+            g.selectAll(".link")
+                .data(links)
+                .enter().append("path")
+                .attr("class", "link")
+                .attr("d", d3.linkHorizontal()
+                    .x(d => d.y)
+                    .y(d => d.x));
+
+            const node = g.selectAll(".node")
+                .data(nodes)
+                .enter().append("g")
+                .attr("class", "node")
+                .attr("transform", d => `translate(${d.y},${d.x})`);
+
+            node.append("circle")
+                .attr("r", 5)
+                .style("fill", d => `rgba(255, 0, 0, ${d.data.value ? (d.data.value + 1) / 2 : 0.1})`);
+
+            node.append("text")
+                .attr("dy", 3)
+                .attr("x", d => d.children ? -8 : 8)
+                .style("text-anchor", d => d.children ? "end" : "start")
+                .text(d => `${d.data.name} (V=${d.data.value.toFixed(2)}, N=${d.data.visits})`);
+        });
+    </script>
+</body>
+</html>
