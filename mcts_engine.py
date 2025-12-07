@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 import asyncio
 import math
+from collections import Counter
 from typing import List, Dict, Optional, Tuple
 from deep_rwkv.config import ProjectConfig
 from deep_rwkv.modeling import DeepRWKV
@@ -33,32 +34,32 @@ class MCTSNode:
 
     def sample_value(self) -> float:
         sampled_q = np.random.beta(self.wins + 1, self.losses + 1)
-        return sampled_q * 2 - 1
+        return sampled_q * 2 - 1 # Scale from [0, 1] to [-1, 1]
 
-    def kl_divergence(self, p, q):
-        if p == 0: return math.log(1 / (1 - q))
-        if p == 1: return math.log(1 / q)
+    def kl_divergence(self, p: float, q: float) -> float:
+        if p == 0: return math.log(1 / (1 - q)) if q < 1 else float('inf')
+        if p == 1: return math.log(1 / q) if q > 0 else float('inf')
+        if q <= 0 or q >= 1: return float('inf')
         return p * math.log(p / q) + (1 - p) * math.log((1 - p) / (1 - q))
 
     def select_child_kl_ucb(self) -> Tuple[int, 'MCTSNode']:
         if not self.children:
             return -1, None
-
-        log_parent_visits = math.log(self.visit_count)
-        best_action = -1
-        best_node = None
-        max_ucb = -float('inf')
+            
+        log_parent_visits = math.log(self.visit_count + 1) # Add 1 to avoid log(0)
+        best_action, best_node, max_ucb = -1, None, -float('inf')
 
         for action, child in self.children.items():
             if child.visit_count == 0:
                 return action, child
             
+            # Smoothed win rate for the child
             p = (child.wins + 1) / (child.visit_count + 2)
             target = (log_parent_visits - math.log(child.visit_count)) / child.visit_count
             
-            q = p
-            high = 1.0
-            for _ in range(8):
+            # Binary search to find the UCB value q
+            q, high = p, 1.0
+            for _ in range(8): # 8 iterations provide sufficient precision
                 mid = (q + high) / 2
                 if self.kl_divergence(p, mid) < target:
                     q = mid
@@ -72,7 +73,7 @@ class MCTSNode:
                 
         return best_action, best_node
 
-class MCTSEngine:
+class _SingleUniverse:
     def __init__(self, model: DeepRWKV, config: ProjectConfig, universe_id: int, strategy: str, visualizer: Optional[VisualizationServer] = None):
         self.model = model
         self.config = config
@@ -80,13 +81,11 @@ class MCTSEngine:
         self.strategy = strategy
         self.visualizer = visualizer
         self.special_tokens = get_special_tokens(model.pipeline)
-        self.root = None
+        self.root: Optional[MCTSNode] = None
 
-    async def initialize(self, prompt: str):
-        root_tokens = self.model.pipeline.encode(prompt)
-        _, root_state = self.model.forward_policy(root_tokens, None)
+    async def initialize(self, root_state):
         self.root = MCTSNode(parent=None, prior=1.0)
-        self.root.state = root_state
+        self.root.state = clone_state(root_state)
         await self._expand(self.root, add_noise=True)
 
     async def search_step(self):
@@ -94,18 +93,18 @@ class MCTSEngine:
             await self._run_batch_simulations(self.root)
         
         if self.visualizer and self.universe_id == 0:
-             tree_data = self.get_tree_visualization_data(self.root)
+             tree_data = self._get_tree_visualization_data(self.root)
              self.visualizer.update_tree_data({
                  "universe_id": self.universe_id, 
                  "strategy": self.strategy,
                  "tree": tree_data
              })
 
-    def advance_root(self):
+    def advance_root(self) -> Optional[int]:
         action = self._select_action(self.root)
-        if action in self.root.children:
+        if action is not None and action in self.root.children:
             self.root = self.root.children[action]
-            self.root.parent = None
+            self.root.parent = None # Prune the tree
             return action
         return None
 
@@ -128,7 +127,7 @@ class MCTSEngine:
         path = [root]
         node = root
         while node.children:
-            if not node.state:
+            if not node.state: # Should not happen in this implementation
                 break
             
             if self.strategy == 'KL_UCB':
@@ -144,9 +143,8 @@ class MCTSEngine:
                 )
             
             if next_node is None:
-                return path, node
+                return path, node # Reached a dead end
 
-            # Critical: Compute state for the child node on-the-fly if it doesn't exist
             if next_node.state is None:
                 _, next_node.state = self.model.forward_policy([action], clone_state(node.state))
             
@@ -160,20 +158,17 @@ class MCTSEngine:
         return await asyncio.gather(*tasks)
 
     async def _expand_and_get_value(self, node: MCTSNode) -> float:
-        # If the node hasn't been expanded, expand it first.
         if not node.children:
             is_terminal = await self._expand(node, add_noise=False)
             if is_terminal:
-                # If a terminal token like <|endoftext|> is generated, assign a neutral value.
-                return 0.0
+                return 0.0 # Neutral value for terminal state
         
         value = 0.0
-        # Combine learned value and heuristic value
         if self.config.mcts.use_learned_value:
             try:
                 learned_value = self.model.forward_value(node.state).item()
                 value += self.config.mcts.learned_value_weight * learned_value
-            except Exception: # Fallback if value head fails
+            except Exception:
                 value += 0.0
 
         if self.config.mcts.learned_value_weight < 1.0:
@@ -183,10 +178,9 @@ class MCTSEngine:
         return value
 
     async def _expand(self, node: MCTSNode, add_noise: bool) -> bool:
-        logits, next_state = self.model.forward_policy([0], clone_state(node.state))
+        logits, _ = self.model.forward_policy([0], clone_state(node.state))
         
-        # Check for termination
-        if torch.argmax(logits) == 0: # end of text token
+        if torch.argmax(logits) == 0:
             return True
 
         probs = F.softmax(logits, dim=-1).squeeze().cpu().numpy()
@@ -202,18 +196,15 @@ class MCTSEngine:
 
     async def _heuristic_rollout(self, node: MCTSNode) -> float:
         rollout_state = clone_state(node.state)
-        # The last token that led to this node's state
         last_token = node.action_token if node.action_token is not None else 0
         
         total_log_prob = 0
         rollout_tokens = []
         
-        # 1. Confidence-based greedy rollout
         for _ in range(self.config.heuristic.rollout_depth):
             logits, rollout_state = self.model.forward_policy([last_token], rollout_state)
             log_probs = F.log_softmax(logits, dim=-1)
             
-            # Use greedy decoding for a stable rollout
             max_log_prob, next_token_tensor = torch.max(log_probs, dim=-1)
             
             total_log_prob += max_log_prob.item()
@@ -222,27 +213,20 @@ class MCTSEngine:
             rollout_tokens.append(next_token)
             last_token = next_token
 
-            # Stop at sentence-like boundaries or end of text
             if last_token == self.special_tokens["newline"] or last_token == 0:
                 break
         
-        # Normalize confidence score to [-1, 1]
         avg_log_prob = total_log_prob / (len(rollout_tokens) if rollout_tokens else 1)
-        # Heuristic mapping: e.g., avg_log_prob of -1 is decent, -5 is bad
-        confidence_score = math.tanh(avg_log_prob / 3.0) # Map to [-1, 1]
+        confidence_score = math.tanh(avg_log_prob / 3.0)
 
-        # 2. Self-reflection (if enabled)
         reflection_prompt_tokens = self.model.pipeline.encode(self.config.heuristic.reflection_prompt)
-        # Append reflection prompt to the state after the rollout
         logits, _ = self.model.forward_policy(reflection_prompt_tokens, rollout_state)
         
         probs = F.softmax(logits, dim=-1)
         p_yes = probs[0, self.special_tokens["yes"]].item()
         p_no = probs[0, self.special_tokens["no"]].item()
-        
         reflection_score = (p_yes - p_no) / (p_yes + p_no + 1e-6)
 
-        # 3. Combine scores
         final_value = (self.config.heuristic.confidence_weight * confidence_score +
                        self.config.heuristic.reflection_weight * reflection_score)
         
@@ -253,28 +237,91 @@ class MCTSEngine:
             node.wins += (value + 1) / 2
             node.losses += (1 - value) / 2
 
-    def _select_action(self, root: MCTSNode) -> int:
-        if not root.children:
-            return 0 # Should not happen if expanded
-        return max(root.children.items(), key=lambda item: item[1].visit_count)[0]
+    def _select_action(self, root: MCTSNode) -> Optional[int]:
+        if not root.children: return None
+        return max(root.children, key=lambda action: root.children[action].visit_count)
 
-    def get_tree_visualization_data(self, node, max_depth=3):
+    def _get_tree_visualization_data(self, node, max_depth=3):
         if max_depth == 0 or not node.children:
-            return {
-                "name": self.model.pipeline.decode([node.action_token]) if node.action_token else "ROOT",
-                "value": node.value,
-                "visits": node.visit_count,
-                "children": []
-            }
+            return {"name": self.model.pipeline.decode([node.action_token]) if node.action_token else "ROOT", "value": node.value, "visits": node.visit_count, "children": []}
         
         children_nodes = list(node.children.values())
         children_nodes.sort(key=lambda x: x.visit_count, reverse=True)
+        children_data = [self._get_tree_visualization_data(child, max_depth - 1) for child in children_nodes[:5]]
+        return {"name": self.model.pipeline.decode([node.action_token]) if node.action_token else "ROOT", "value": node.value, "visits": node.visit_count, "children": children_data}
 
-        children_data = [self.get_tree_visualization_data(child, max_depth - 1) for child in children_nodes[:5]]
 
+class ParallelMCTSEngine:
+    def __init__(self, config: ProjectConfig, num_universes: int = 3):
+        self.config = config
+        self.num_universes = num_universes
+        
+        print("[DeepRWKV] Initializing DeepRWKV Model...")
+        self.model = DeepRWKV(config)
+        
+        print("[DeepRWKV] Initializing Visualization Server...")
+        self.visualizer = VisualizationServer()
+        
+        self.universes: List[_SingleUniverse] = []
+        
+        strategies = ['PUCT', 'KL_UCB', 'Thompson']
+        for i in range(num_universes):
+            strategy = strategies[i % len(strategies)]
+            print(f"[Universe {i}] Assigning search strategy: {strategy}")
+            self.universes.append(_SingleUniverse(self.model, config, i, strategy, self.visualizer))
+
+    async def run(self, prompt: str, max_new_tokens: int = 256) -> Dict:
+        self.visualizer.run()
+        
+        print("[DeepRWKV] Bootstrapping all universes...")
+        prompt_tokens = self.model.pipeline.encode(prompt)
+        _, root_state = self.model.forward_policy(prompt_tokens, None)
+        
+        init_tasks = [u.initialize(root_state) for u in self.universes]
+        await asyncio.gather(*init_tasks)
+
+        full_responses = {i: [] for i in range(self.num_universes)}
+        consensus_tokens = []
+        
+        for step in range(max_new_tokens):
+            print(f"\n--- Reasoning Step {step + 1} ---")
+            
+            search_tasks = [u.search_step() for u in self.universes]
+            await asyncio.gather(*search_tasks)
+            
+            actions = [u.advance_root() for u in self.universes]
+            valid_actions = [a for a in actions if a is not None]
+
+            if not valid_actions:
+                print("[DeepRWKV] All universes failed to select an action. Terminating.")
+                break
+
+            consensus_action = Counter(valid_actions).most_common(1)[0][0]
+            consensus_tokens.append(consensus_action)
+            
+            vote_log = {f"U{i} ({u.strategy})": f"'{self.model.pipeline.decode([a])}'" if a else "FAIL" for i, (u, a) in enumerate(zip(self.universes, actions))}
+            print(f"[Voting] Votes: {vote_log} -> Consensus: '{self.model.pipeline.decode([consensus_action])}'")
+            
+            sync_tasks = []
+            for i, (universe, action) in enumerate(zip(self.universes, actions)):
+                full_responses[i].append(action if action is not None else 0)
+                if action != consensus_action:
+                    if universe.root.parent and consensus_action in universe.root.parent.children:
+                        universe.root = universe.root.parent.children[consensus_action]
+                        universe.root.parent = None
+                    else:
+                        print(f"[Sync Error] Universe {i} cannot be synced.")
+
+                if universe.root and not universe.root.children:
+                    sync_tasks.append(universe._expand(universe.root, add_noise=True))
+
+            if sync_tasks: await asyncio.gather(*sync_tasks)
+
+            if consensus_action == 0 or self.model.pipeline.decode([consensus_action]) == "\n\n":
+                print("\n[DeepRWKV] Termination condition met.")
+                break
+        
         return {
-            "name": self.model.pipeline.decode([node.action_token]) if node.action_token else "ROOT",
-            "value": node.value,
-            "visits": node.visit_count,
-            "children": children_data
+            "consensus_response": self.model.pipeline.decode(consensus_tokens),
+            "universe_responses": {i: self.model.pipeline.decode(resp) for i, resp in full_responses.items()}
         }
